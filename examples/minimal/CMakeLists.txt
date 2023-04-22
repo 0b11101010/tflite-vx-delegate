@@ -32,7 +32,7 @@ endif()
 include_directories(${TFLITE_SOURCE_DIR}/delegates/external)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 add_executable(minimal
   minimal.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/../util.cc
@@ -40,7 +40,6 @@ add_executable(minimal
 target_link_libraries(minimal
   TensorFlow::tensorflow-lite
   vx_custom_op
-  vx_delegate
   ${CMAKE_DL_LIBS}
 )
 

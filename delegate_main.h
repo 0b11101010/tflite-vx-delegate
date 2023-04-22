@@ -43,8 +43,10 @@
 #include "tim/vx/operation.h"
 #include "tim/vx/tensor.h"
 
-#include "tim/vx/platform/platform.h"
-#include "tim/vx/platform/native.h"
+#ifdef MULTI_DEVICE_FEATURE_MODE
+  #include "tim/vx/platform/platform.h"
+  #include "tim/vx/platform/native.h"
+#endif
 
 namespace vx {
 namespace delegate {
@@ -52,10 +54,6 @@ namespace delegate {
 typedef struct {
   //Allowed save or load nbg binary
   bool allowed_cache_mode;
-  //Allowed run multi device mode
-  bool allowed_multi_device_mode;
-  //Store model location
-  std::string model_location;
   //Device in multi device mode
   int32_t device_id;
   //nbg binary path
@@ -84,8 +82,6 @@ struct OpData {
 struct DerivedDelegateData {
     TfLiteDelegate parent;
     bool allow_cache_mode;
-    bool allow_multi_device_mode;
-    std::string model_location;
     int32_t device_id;
     std::string cache_path;
 };
@@ -118,10 +114,13 @@ class Delegate {
   void CreateCacheOp(const OpData& op_data);
 
   std::vector<std::shared_ptr<tim::vx::Operation>>& GetOps() { return ops_; }
+  int GetOperationOutput(uint32_t index) { return op_info_.outputs[index]; }
   std::shared_ptr<tim::vx::Graph>& GetGraph() { return graph_; }
   std::map<int32_t, std::shared_ptr<tim::vx::Tensor>>& GetTensors() {
     return tensors_;
   }
+
+  std::map<std::shared_ptr<tim::vx::Tensor>,std::shared_ptr<tim::vx::Tensor>> map_BroadcastTo;
 
  private:
   struct OperationDataType {
@@ -133,13 +132,15 @@ class Delegate {
     std::vector<uint8_t> builtin_data;
   };
 
-  std::shared_ptr<tim::vx::Context> context_;
+#ifdef MULTI_DEVICE_FEATURE_MODE
   std::vector<std::shared_ptr<tim::vx::platform::IDevice>> devices_;
   std::shared_ptr<tim::vx::platform::IExecutor> executor_;
   std::shared_ptr<tim::vx::platform::IExecutable> executable_;
   std::vector<std::shared_ptr<tim::vx::platform::ITensorHandle>> inputs_;
   std::vector<std::shared_ptr<tim::vx::platform::ITensorHandle>> outputs_;
+#endif
 
+  std::shared_ptr<tim::vx::Context> context_;
   std::shared_ptr<tim::vx::Graph> graph_;
   //first: layout infered graph; second: map from src_tensor to infered_tensor.
   std::pair<std::shared_ptr<tim::vx::Graph>,
@@ -150,10 +151,10 @@ class Delegate {
   std::map<int32_t, std::shared_ptr<tim::vx::Tensor>> state_tensors_;
   std::vector<std::shared_ptr<tim::vx::Operation>> ops_;
   std::vector<OperationDataType> operations_;
+  struct OperationDataType op_info_;
   bool compiled_;
 
   absl::optional<bool> is_cache_present_;
-  absl::optional<bool> is_multi_device_;
   uint32_t device_id_;
 
   size_t nbg_size_;

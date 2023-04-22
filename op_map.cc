@@ -1,26 +1,26 @@
 /****************************************************************************
- *
- *    Copyright (c) 2021 Vivante Corporation
- *
- *    Permission is hereby granted, free of charge, to any person obtaining a
- *    copy of this software and associated documentation files (the "Software"),
- *    to deal in the Software without restriction, including without limitation
- *    the rights to use, copy, modify, merge, publish, distribute, sublicense,
- *    and/or sell copies of the Software, and to permit persons to whom the
- *    Software is furnished to do so, subject to the following conditions:
- *
- *    The above copyright notice and this permission notice shall be included in
- *    all copies or substantial portions of the Software.
- *
- *    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- *    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- *    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- *THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- *    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- *    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- *    DEALINGS IN THE SOFTWARE.
- *
- *****************************************************************************/
+*
+*    Copyright (c) 2021 Vivante Corporation
+*
+*    Permission is hereby granted, free of charge, to any person obtaining a
+*    copy of this software and associated documentation files (the "Software"),
+*    to deal in the Software without restriction, including without limitation
+*    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+*    and/or sell copies of the Software, and to permit persons to whom the
+*    Software is furnished to do so, subject to the following conditions:
+*
+*    The above copyright notice and this permission notice shall be included in
+*    all copies or substantial portions of the Software.
+*
+*    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+*    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+*    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+*    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+*    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+*    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+*    DEALINGS IN THE SOFTWARE.
+*
+*****************************************************************************/
 
 #include <algorithm>
 #include <array>
@@ -43,6 +43,7 @@
 #include "tim/vx/ops.h"
 #include "utils.h"
 #include "vsi_npu_custom_op.h"
+#include "delegate_main.h"
 
 using namespace tflite;
 using namespace tflite::ops::builtin;
@@ -291,7 +292,9 @@ struct OpMapperBase : public vx::op_map::IOpMapper {
       if (input_index < 0) {
         continue;
       }
-      if (context->tensors[input_index].type == kTfLiteInt64) {
+      if (context->tensors[input_index].type == kTfLiteInt64 &&
+          registration->builtin_code != 130) {
+        // op 130 (BroadcastTo) can be bypassed because the next op will do broadcast automatically.
         TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Int64 input is not supported");
         return false;
       }
@@ -311,6 +314,12 @@ struct OpMapperBase : public vx::op_map::IOpMapper {
           TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
                           "vx-delegate doesn't support the tensor of which one "
                           "of dims is 0");
+          return false;
+        }
+        if ((context->tensors[input_index].dims->data[j] > 65535) && (j > 0)) {
+          TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                          "vx-delegate doesn't support tensor height/width > "
+                          "65535");
           return false;
         }
       }
@@ -384,6 +393,60 @@ struct OpMapperBase : public vx::op_map::IOpMapper {
       const void* params) {
     return false;
   }
+
+  std::vector<int32_t> ExtendBroadcast(const std::shared_ptr<tim::vx::Tensor>& base_shape_tensor,
+                  const std::shared_ptr<tim::vx::Tensor>& required_broadcast_tensor){
+     std::vector<uint32_t> shape (base_shape_tensor->GetShape().size());
+     std::vector<int32_t> broadcast_param;
+     for(int i = 0; i < base_shape_tensor->GetShape().size();i++){
+      shape[i] = i < required_broadcast_tensor->GetShape().size() ?
+                 required_broadcast_tensor->GetShape()[i] : 1;
+      broadcast_param.push_back(shape[i]);
+     }
+     return broadcast_param;
+  }
+
+  std::vector<std::shared_ptr<tim::vx::Tensor>> HandleNeedBroadcastOp(
+        vx::delegate::Delegate* delegate,
+        std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+        std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+        const void* params) {
+    bool broadcast_required = (inputs[0]->GetShape().size() != inputs[1]->GetShape().size());
+    std::vector<std::shared_ptr<tim::vx::Tensor>> elementwise_inputs;
+
+    for (auto &t : inputs){
+      if(delegate->map_BroadcastTo.find(t) != delegate->map_BroadcastTo.end())
+        {
+          t = delegate->map_BroadcastTo[t];
+        }
+    }
+
+    if (broadcast_required) {
+      int base_shape_idx = inputs[0]->GetShape().size() >
+                  inputs[1]->GetShape().size()? 0 : 1;
+      std::vector<int32_t> broadcast_param;
+      broadcast_param = ExtendBroadcast(inputs[base_shape_idx], inputs[1-base_shape_idx]);
+      tim::vx::TensorSpec broadcast_spec (inputs[1-base_shape_idx]->GetSpec().AsTransientSpec());
+
+      auto broadcast_out = delegate->GetGraph()->CreateTensor(broadcast_spec);
+      auto op_broadcast =
+            delegate->GetGraph()->CreateOperation<tim::vx::ops::Broadcast>(
+                broadcast_param);
+        (*op_broadcast).BindInput(inputs[1-base_shape_idx]).BindOutput(broadcast_out);
+
+        if(base_shape_idx == 0){
+          elementwise_inputs.push_back(inputs[base_shape_idx]);
+          elementwise_inputs.push_back(broadcast_out);
+        }
+        else{
+          elementwise_inputs.push_back(broadcast_out);
+          elementwise_inputs.push_back(inputs[base_shape_idx]);
+        }
+
+      return elementwise_inputs;
+    }
+    return inputs;
+  }
 };
 
 }  // namespace
@@ -410,6 +473,8 @@ struct SimpleOpMapper : public OpMapperBase<EmptyStructPlaceholder> {
     return true;
   }
 };
+
+
 
 template <typename T_OperationType>
 struct PowMapper : public SimpleOpMapper<T_OperationType> {
@@ -518,11 +583,11 @@ struct QuantizeMapper : public SimpleOpMapper<T_OperationType> {
 };
 
 template <typename T_OperationType, typename T_Param>
-struct SimpleOpWithFusedActiovationMapper
+struct SimpleOpWithFusedActivationMapper
     : public OpMapperBase<T_Param, FusedActivationAction<0, T_Param>> {
   std::string name_;
 
-  SimpleOpWithFusedActiovationMapper(std::string name) : name_(name) {}
+  SimpleOpWithFusedActivationMapper(std::string name) : name_(name) {}
 
   bool IsOpSupported(TfLiteContext* context,
                      TfLiteNode* node,
@@ -554,48 +619,41 @@ struct SimpleOpWithFusedActiovationMapper
                    const void* params) override {
     TFLITE_LOG(TFLITE_LOG_INFO, "Creating %s op", name_.c_str());
 
-    bool boradcast_required = (inputs[0]->GetShape() != inputs[1]->GetShape());
-    std::vector<std::shared_ptr<tim::vx::Tensor>> elementwise_inputs;
-    if (boradcast_required) {
-      tim::vx::TensorSpec spec = inputs[0]->GetSpec();
-      spec = spec.AsTransientSpec();
-      auto broadcast_out = delegate->GetGraph()->CreateTensor(spec);
-      if (inputs[0]->GetShape().size() > inputs[1]->GetShape().size()) {
-        std::vector<uint32_t> shape = inputs[0]->GetShape();
-        std::vector<int32> broadcast_param;
-        for (auto iter = shape.begin(); iter != shape.end(); iter++) {
-          broadcast_param.push_back(*iter);
-        }
-        auto op_broadcast =
-            delegate->GetGraph()->CreateOperation<tim::vx::ops::Broadcast>(
-                broadcast_param);
-        (*op_broadcast).BindInput(inputs[1]).BindOutput(broadcast_out);
-        elementwise_inputs.push_back(inputs[0]);
-        elementwise_inputs.push_back(broadcast_out);
-      } else {
-        std::vector<uint32_t> shape = inputs[1]->GetShape();
-        std::vector<int32> broadcast_param;
-        for (auto iter = shape.begin(); iter != shape.end(); iter++) {
-          broadcast_param.push_back(*iter);
-        }
-        auto op_broadcast =
-            delegate->GetGraph()->CreateOperation<tim::vx::ops::Broadcast>(
-                broadcast_param);
-        (*op_broadcast).BindInput(inputs[0]).BindOutput(broadcast_out);
-        elementwise_inputs.push_back(broadcast_out);
-        elementwise_inputs.push_back(inputs[1]);
-      }
-    }
-
+    auto broadcasted_inputs = this->HandleNeedBroadcastOp(delegate, inputs, outputs, params);
     auto op = delegate->GetGraph()->CreateOperation<T_OperationType>();
-    boradcast_required ? (*op).BindInputs(elementwise_inputs)
-                   : (*op).BindInputs(inputs);
+    (*op).BindInputs(broadcasted_inputs);
     (*op).BindOutputs(outputs);
     delegate->GetOps().push_back(std::move(op));
-
     return true;
   }
 };
+
+template <typename T_OperationType>
+struct SimpleOpWithBroadcastNoActivationMapper
+    : public OpMapperBase<EmptyStructPlaceholder> {
+  std::string name_;
+
+  SimpleOpWithBroadcastNoActivationMapper(std::string name) : name_(name) {}
+
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Creating %s op", name_.c_str());
+
+    auto broadcasted_inputs = this->HandleNeedBroadcastOp(delegate, inputs, outputs, params);
+    auto op = delegate->GetGraph()->CreateOperation<T_OperationType>();
+    (*op).BindInputs(broadcasted_inputs);
+    (*op).BindOutputs(outputs);
+    delegate->GetOps().push_back(std::move(op));
+    return true;
+  }
+};
+
+using MaximumMapper =
+    SimpleOpWithBroadcastNoActivationMapper<tim::vx::ops::Maximum>;
+using MinimumMapper =
+    SimpleOpWithBroadcastNoActivationMapper<tim::vx::ops::Minimum>;
 
 template <typename T_Param>
 struct Conv2dKind
@@ -644,6 +702,7 @@ struct FullyConnectedMapper
         reinterpret_cast<const TfLiteFullyConnectedParams*>(params);
     auto input_tensor = inputs[0];
     auto weight_tensor = inputs[1];
+    uint32_t temp_batch = 1;
 
     if (input_tensor->GetShape().size() > 2 ||
         (input_tensor->GetShape().size() == 2 &&
@@ -653,10 +712,10 @@ struct FullyConnectedMapper
       for (int i = 0; i < input_tensor->GetShape().size(); i++) {
         total_input_size *= input_tensor->GetShape()[i];
       }
-      uint32_t input_batch = total_input_size / input_size;
+      temp_batch = total_input_size / input_size;
       auto reshape_output = delegate->GetGraph()->CreateTensor(
           input_tensor->GetSpec().AsTransientSpec());
-      std::vector<uint32_t> new_shape{input_size, input_batch};
+      std::vector<uint32_t> new_shape{input_size, temp_batch};
       auto reshape_op =
           delegate->GetGraph()->CreateOperation<tim::vx::ops::Reshape>(
               new_shape);
@@ -670,29 +729,37 @@ struct FullyConnectedMapper
         delegate->GetGraph()->CreateOperation<tim::vx::ops::FullyConnected>(
             0, weight_tensor->GetShape()[1]);
     (*op).BindInputs(inputs);
-    (*op).BindOutputs(outputs);
 
-    delegate->GetOps().push_back(std::move(op));
+    if (outputs[0]->GetShape().size() > 2) {
+      std::vector<uint32_t> real_output_shape = { weight_tensor->GetShape()[1],
+          temp_batch};
+      tim::vx::TensorSpec real_output_spec(inputs[0]->GetDataType(),
+                            real_output_shape, tim::vx::TensorAttribute::TRANSIENT);
+      auto real_output = delegate->GetGraph()->CreateTensor(real_output_spec);
+
+      (*op).BindOutput(real_output);
+
+      delegate->GetOps().push_back(std::move(op));
+
+      auto reshape_op =
+          delegate->GetGraph()->CreateOperation<tim::vx::ops::Reshape>(
+              outputs[0]->GetShape());
+
+      (*reshape_op).BindInput(real_output);
+      (*reshape_op).BindOutput(outputs[0]);
+      delegate->GetOps().push_back(reshape_op);
+    }
+    else {
+      (*op).BindOutputs(outputs);
+
+       delegate->GetOps().push_back(std::move(op));
+    }
 
     return true;
   }
 };
 
 struct SoftmaxMapper : public OpMapperBase<TfLiteSoftmaxParams> {
-  bool IsOpSupported(TfLiteContext* context,
-                     TfLiteNode* node,
-                     const TfLiteRegistration* registration) const override {
-    int input_index = node->inputs->data[0];
-    auto input_dims = context->tensors[input_index].dims;
-    if (input_dims->data[1] > 65535 || input_dims->data[2] > 65535) {
-      TFLITE_LOG_PROD(
-          TFLITE_LOG_ERROR,
-          "vx-delegate doesn't support tensor height/width > 65535");
-      return false;
-    }
-    return true;
-  }
-
   bool HandleMapOp(vx::delegate::Delegate* delegate,
                    std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
                    std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
@@ -741,7 +808,7 @@ struct Conv2dMapper : public Conv2dKind<TfLiteConvParams> {
     uint32_t kernel_h = inputs[1]->GetShape()[2];
     uint32_t kernel_w = inputs[1]->GetShape()[1];
     const auto builtin = reinterpret_cast<const TfLiteConvParams*>(params);
-    std::shared_ptr<tim::vx::DirectMapOp> op;
+    std::shared_ptr<tim::vx::Operation> op;
     if (inputs[0]->GetShape()[0] == inputs[1]->GetShape()[0]) {
       TFLITE_LOG(TFLITE_LOG_INFO, "Creating Conv2d op");
       op = delegate->GetGraph()->CreateOperation<tim::vx::ops::Conv2d>(
@@ -798,20 +865,19 @@ struct TransposeConvMapper : public OpMapperBase<TfLiteTransposeConvParams> {
     auto stride_width = builtin->stride_width;
     auto stride_height = builtin->stride_height;
 
-    std::vector<int32_t> output_shape(inputs[0]->GetShape()[0]);
-    inputs[0]->CopyDataFromTensor(output_shape.data());
-
     uint32_t input_width = inputs[2]->GetShape()[1];
     uint32_t input_height = inputs[2]->GetShape()[2];
     uint32_t ksize_width = inputs[1]->GetShape()[1];
     uint32_t ksize_height = inputs[1]->GetShape()[2];
+    uint32_t output_width = outputs[0]->GetShape()[1];
+    uint32_t output_height = outputs[0]->GetShape()[2];
     uint32_t weights = inputs[1]->GetShape()[3];
     int32_t pad_left_inter = static_cast<int32_t>(
-        ksize_width + stride_width * (input_width - 1) - output_shape[2]);
+        ksize_width + stride_width * (input_width - 1) - output_width);
     uint32_t pad_left = pad_left_inter / 2;
     uint32_t pad_right = pad_left_inter - pad_left;
     int32_t pad_top_inter = static_cast<int32_t>(
-        ksize_height + stride_height * (input_height - 1) - output_shape[1]);
+        ksize_height + stride_height * (input_height - 1) - output_height);
     uint32_t pad_top = pad_top_inter / 2;
     uint32_t pad_bottom = pad_top_inter - pad_top;
     std::array<uint32_t, 2> ksize{ksize_width, ksize_height};
@@ -973,13 +1039,10 @@ struct LocalResponseNormalizationMapper
     TFLITE_LOG(TFLITE_LOG_INFO, "Creating LRN op");
     const auto builtin =
         reinterpret_cast<const TfLiteLocalResponseNormParams*>(params);
+    int size = builtin->radius * 2 + 1; // radius is the half of normalization window
     auto op = delegate->GetGraph()
                   ->CreateOperation<tim::vx::ops::LocalResponseNormalization>(
-                      builtin->radius,
-                      builtin->alpha,
-                      builtin->beta,
-                      builtin->bias,
-                      0);
+                      size, builtin->alpha, builtin->beta, builtin->bias, 0);
     (*op).BindInputs(inputs).BindOutputs(outputs);
 
     delegate->GetOps().push_back(std::move(op));
@@ -1011,12 +1074,16 @@ struct ReshapeMapper : public OpMapperBase<TfLiteReshapeParams> {
   virtual bool IsOpSupported(TfLiteContext* context,
                              TfLiteNode* node,
                              const TfLiteRegistration* registration) const {
-    auto input_tensor = context->tensors[node->inputs->data[0]];
     auto output_index = node->outputs->data[0];
-
-    if (context->tensors[output_index].dims->size == 0) {
+    if (node->inputs->size==2 &&
+       context->tensors[node->inputs->data[1]].allocation_type!=kTfLiteMmapRo) {
       TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
-                      "dynamic shape in not support in reshape.");
+                      "Dynamic input shape is not supported in reshape.");
+      return false;
+    }
+    if (context->tensors[node->outputs->data[0]].dims->size == 0) {
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                      "Dynamic output shape is not supported in reshape.");
       return false;
     }
     return true;
@@ -1083,10 +1150,21 @@ struct StridedSliceMapper : public OpMapperBase<TfLiteStridedSliceParams> {
     TFLITE_LOG(TFLITE_LOG_INFO, "Check  StridedSlice");
     const auto builtin =
         reinterpret_cast<const TfLiteStridedSliceParams*>(node->builtin_data);
-    if (builtin->new_axis_mask) {
-      TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "new_axis_mask > 0 is not supported");
+    auto begin_tensor = context->tensors[node->inputs->data[1]];
+    auto end_tensor = context->tensors[node->inputs->data[2]];
+    auto strides_tensor = context->tensors[node->inputs->data[3]];
+    if (begin_tensor.allocation_type != kTfLiteMmapRo ||
+        end_tensor.allocation_type != kTfLiteMmapRo ||
+        strides_tensor.allocation_type != kTfLiteMmapRo){
+      TFLITE_LOG_PROD(
+          TFLITE_LOG_ERROR,
+          "begin_tensor, end_tensor and strides_tensor must be constant.");
       return false;
     }
+      if (builtin->new_axis_mask) {
+        TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "new_axis_mask > 0 is not supported");
+        return false;
+      }
     if (builtin->ellipsis_mask) {
       TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "ellipsis_mask > 0 is not supported");
       return false;
@@ -1115,6 +1193,9 @@ struct StridedSliceMapper : public OpMapperBase<TfLiteStridedSliceParams> {
     std::vector<int32_t> begin_dims(begin_tensor->GetShape()[0]);
     begin_tensor->CopyDataFromTensor(begin_dims.data());
     for (size_t i = 0; i < begin_dims.size(); i++) {
+      if(begin_dims[i] < 0) {
+        begin_dims[i] += input_tensor->GetShape()[begin_dims.size()-1-i];
+      }
       if (begin_mask & (1 << i)) {
         begin_dims[i] = -1;
       }
@@ -1130,6 +1211,9 @@ struct StridedSliceMapper : public OpMapperBase<TfLiteStridedSliceParams> {
                                           });
     end_tensor->CopyDataFromTensor(end_dims.data());
     for (size_t i = 0; i < end_dims.size(); i++) {
+      if(end_dims[i] < 0) {
+        end_dims[i] += input_tensor->GetShape()[end_dims.size()-1-i];
+      }
       if (end_mask & (1 << i)) {
         end_dims[i] = end_pos;
       }
@@ -1266,14 +1350,82 @@ struct PadMapper : public OpMapperBase<EmptyStructPlaceholder> {
   }
 };
 
+struct MirrorPadMapper : public OpMapperBase<EmptyStructPlaceholder> {
+  virtual bool IsOpSupported(TfLiteContext* context,
+                             TfLiteNode* node,
+                             const TfLiteRegistration* registration) const {
+
+    if(0 == context->tensors[node->outputs->data[0]].dims->size){
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING, "MirrorPad cannot support dynamic shape");
+      return false;
+    }
+    const auto builtin =
+        reinterpret_cast<const TfLiteMirrorPaddingParams*>(node->builtin_data);
+    if(builtin->mode == kTfLiteMirrorPaddingUnknown){
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING, "MirrorPad mode should have certain value");
+      return false;
+    }
+
+    return true;
+  }
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Creating Mirror Pad op");
+    auto padding = inputs[1];
+    std::vector<uint32_t> padding_shape = padding->GetShape();
+    uint32_t pad = 1;
+    for (auto s : padding_shape) {
+      pad *= s;
+    }
+    std::vector<uint32_t> pad_size(pad);
+    padding->CopyDataFromTensor(pad_size.data());
+    std::vector<uint32_t> front_size;
+    std::vector<uint32_t> back_size;
+    for (int i = pad_size.size() - 1; i >= 0; i -= 2) {
+      back_size.push_back(pad_size[i]);
+      front_size.push_back(pad_size[i - 1]);
+    }
+    int32_t val = 0;
+    if (inputs.size() > 2) {
+      auto pad_value = inputs[2];
+      if (!pad_value->IsPlaceHolder()) {
+        pad_value->CopyDataFromTensor(&val);
+      }
+    }
+
+    const auto builtin =
+        reinterpret_cast<const TfLiteMirrorPaddingParams*>(params);
+    tim::vx::ops::Pad::pad_mode_type mode = tim::vx::ops::Pad::PAD_MODE_CONSTANT;
+    switch (builtin->mode) {
+      case kTfLiteMirrorPaddingReflect:
+        mode=tim::vx::ops::Pad::PAD_MODE_REFLECT;
+        break;
+      case kTfLiteMirrorPaddingSymmetric:
+        mode = tim::vx::ops::Pad::PAD_MODE_SYMMETRIC;
+      default:
+        break;
+    }
+
+    auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::Pad>(
+        front_size, back_size, val, mode);
+    (*op).BindInput(inputs[0]).BindOutputs(outputs);
+
+    delegate->GetOps().push_back(std::move(op));
+
+    return true;
+  }
+};
+
 using AddMapper =
-    SimpleOpWithFusedActiovationMapper<tim::vx::ops::Add, TfLiteAddParams>;
+    SimpleOpWithFusedActivationMapper<tim::vx::ops::Add, TfLiteAddParams>;
 using SubMapper =
-    SimpleOpWithFusedActiovationMapper<tim::vx::ops::Sub, TfLiteSubParams>;
+    SimpleOpWithFusedActivationMapper<tim::vx::ops::Sub, TfLiteSubParams>;
 using DivMapper =
-    SimpleOpWithFusedActiovationMapper<tim::vx::ops::Div, TfLiteDivParams>;
+    SimpleOpWithFusedActivationMapper<tim::vx::ops::Div, TfLiteDivParams>;
 using MulMapper =
-    SimpleOpWithFusedActiovationMapper<tim::vx::ops::Multiply, TfLiteMulParams>;
+    SimpleOpWithFusedActivationMapper<tim::vx::ops::Multiply, TfLiteMulParams>;
 
 template <tim::vx::ResizeType resizeType>
 struct ResizeMapper : public OpMapperBase<TfLiteResizeNearestNeighborParams> {
@@ -1284,6 +1436,11 @@ struct ResizeMapper : public OpMapperBase<TfLiteResizeNearestNeighborParams> {
         TFLITE_LOG_INFO, "Check Resize(%d)", static_cast<int>(resizeType));
 
     int input_index = node->inputs->data[0];
+    int shape_index = node->inputs->data[1];
+    if (context->tensors[shape_index].allocation_type != kTfLiteMmapRo) {
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "shape tensor must be constant.");
+      return false;
+    }
     if ((context->tensors[input_index].type == kTfLiteInt8 ||
          context->tensors[input_index].type == kTfLiteUInt8) &&
         context->tensors[input_index].quantization.type ==
@@ -1628,8 +1785,7 @@ struct BatchMatmul : public OpMapperBase<TfLiteBatchMatMulParams> {
                       "I32 outputs type is not supported in BatchMatmul");
       return false;
     }
-    if ((context->tensors[node->inputs->data[0]].type == kTfLiteInt8 ||
-         context->tensors[node->inputs->data[1]].type == kTfLiteInt8) ||
+    if (
         (context->tensors[node->inputs->data[1]].type == kTfLiteFloat32 &&
          context->tensors[node->inputs->data[0]].type == kTfLiteInt8)) {
       TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
@@ -1657,21 +1813,21 @@ struct BatchMatmul : public OpMapperBase<TfLiteBatchMatMulParams> {
 
     std::vector<std::vector<uint32_t>> in_shape = {inputs[0]->GetShape(),
                                                    inputs[1]->GetShape()};
-    bool boradcast_required = false;
+    bool broadcast_required = false;
 
     // Need broadcast or not
     if (in_shape[0].size() != in_shape[1].size()) {
-      boradcast_required = true;
+      broadcast_required = true;
     } else {
       for (int i = 2; i < in_shape[0].size(); ++i) {
         if (in_shape[0][i] != in_shape[1][i]) {
-          boradcast_required = true;
+          broadcast_required = true;
         }
       }
     }
 
     std::vector<std::shared_ptr<tim::vx::Tensor>> broadcast_out;
-    if (boradcast_required) {
+    if (broadcast_required) {
       int out_cnt;
       auto dim_iter0 = in_shape[0].begin();
       auto dim_iter1 = in_shape[1].begin();
@@ -1723,7 +1879,7 @@ struct BatchMatmul : public OpMapperBase<TfLiteBatchMatMulParams> {
     // adj_x & adj_y both true are not supported
     auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::Matmul>(
         adj_x, adj_y);
-    boradcast_required
+    broadcast_required
         ? (*op).BindInput(broadcast_out[0]).BindInput(broadcast_out[1])
         : (*op).BindInputs(inputs);
     (*op).BindOutputs(outputs);
@@ -1768,6 +1924,192 @@ struct Rnn : public OpMapperBase<TfLiteRNNParams> {
 
     (*op).BindInputs(inputs);
     (*op).BindOutputs(outputs);
+
+    delegate->GetOps().push_back(std::move(op));
+
+    return true;
+  }
+};
+
+struct BidirectionalSequenceRnn : public OpMapperBase<TfLiteBidirectionalSequenceRNNParams>{
+  constexpr static int kInputTensor = 0;
+  // Forward and backward cell tensors.
+  constexpr static int kFwWeightsTensor = 1;
+  constexpr static int kFwRecurrentWeightsTensor = 2;
+  constexpr static int kFwBiasTensor = 3;
+  constexpr static int kFwHiddenStateTensor = 4;
+  constexpr static int kBwWeightsTensor = 5;
+  constexpr static int kBwRecurrentWeightsTensor = 6;
+  constexpr static int kBwBiasTensor = 7;
+  constexpr static int kBwHiddenStateTensor = 8;
+
+  constexpr static int kAuxInputTensor = 9;       // Optional.
+  constexpr static int kFwAuxWeightsTensor = 10;  // Optional.
+  constexpr static int kBwAuxWeightsTensor = 11;  // Optional.
+  // Output tensors.
+  constexpr static int kFwOutputTensor = 0;
+  constexpr static int kBwOutputTensor = 1;  // Only if merge_outputs is false.
+
+  bool IsOpSupported(TfLiteContext* context,
+                             TfLiteNode* node,
+                             const TfLiteRegistration* registration ) const{
+    int fw_weights_index = node->inputs->data[kFwWeightsTensor];
+    int aux_input_index = node->inputs->data[kAuxInputTensor];
+    int aux_fw_index = node->inputs->data[kFwAuxWeightsTensor];
+
+    if ( context->tensors[fw_weights_index].type != kTfLiteFloat32 )
+    {
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "Does not support quantized weight in BidirectionalSequenceRnn");
+       return false;
+    }
+    if ( aux_input_index != -1 && aux_fw_index == -1 )
+    {
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "Does not support auxiliary inputs without auxiliary weights in BidirectionalSequenceRnn");
+       return false;
+    }
+    return true;
+  }
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Create BidirectionalSequenceRNN op");
+    const auto builtin = reinterpret_cast<const TfLiteBidirectionalSequenceRNNParams*> (params);
+    bool time_major = builtin -> time_major;
+    tim::vx::ops::BidirectionalSequenceRnn::ActivationType act;
+    bool merge_outputs = builtin -> merge_outputs;
+    switch (builtin -> activation)
+    {
+    case kTfLiteActRelu:
+      act = tim::vx::ops::BidirectionalSequenceRnn::kRELU;
+      break;
+    case kTfLiteActRelu6:
+      act = tim::vx::ops::BidirectionalSequenceRnn::kRELU6;
+      break;
+    case kTfLiteActTanh:
+      act = tim::vx::ops::BidirectionalSequenceRnn::kTANH;
+      break;
+    case kTfLiteActSigmoid:
+      act = tim::vx::ops::BidirectionalSequenceRnn::kSIGMOID;
+      break;
+    default:
+      printf("Not supported activition type for BidirectionalSequenceRnn = %d", static_cast<int32_t>(builtin -> activation));
+      break;
+    }
+
+    auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::BidirectionalSequenceRnn>(act, time_major, merge_outputs);
+    auto tensor_placeholder = delegate->GetGraph()->CreateTensorPlaceHolder();
+
+    std::vector<std::shared_ptr<tim::vx::Tensor>> input_tensors = {
+      inputs[kInputTensor],
+
+      inputs[kFwWeightsTensor],
+      inputs[kFwRecurrentWeightsTensor],
+      inputs[kFwBiasTensor],
+      tensor_placeholder,
+      inputs[kFwHiddenStateTensor],
+
+      inputs[kBwWeightsTensor],
+      inputs[kBwRecurrentWeightsTensor],
+      inputs[kBwBiasTensor],
+      tensor_placeholder,
+      inputs[kBwHiddenStateTensor],
+    };
+
+    std::vector<std::shared_ptr<tim::vx::Tensor>> output_tensors = {
+      tensor_placeholder,
+      tensor_placeholder,
+      outputs[kFwOutputTensor],
+      merge_outputs ?  tensor_placeholder : outputs[kBwOutputTensor],
+    };
+
+    if (inputs.size() == 12) {
+      // Aux
+      input_tensors.push_back(inputs[kAuxInputTensor]);
+      input_tensors.push_back(inputs[kFwAuxWeightsTensor]);
+      input_tensors.push_back(inputs[kBwAuxWeightsTensor]);
+    }
+
+    (*op).BindInputs(input_tensors);
+
+    (*op).BindOutputs(output_tensors);
+
+    delegate->GetOps().push_back(std::move(op));
+
+    return true;
+  }
+};
+
+struct UnidirectionalSequenceRnn : public OpMapperBase<TfLiteSequenceRNNParams>{
+  // Input tensors.
+  constexpr static int kInputTensor = 0;
+  constexpr static int kWeightsTensor = 1;
+  constexpr static int kRecurrentWeightsTensor = 2;
+  constexpr static int kBiasTensor = 3;
+  constexpr static int kHiddenStateTensor = 4;
+  // Output tensor.
+  constexpr static int kOutputTensor = 0;
+
+  bool IsOpSupported (TfLiteContext* context,
+                      TfLiteNode* node,
+                      const TfLiteRegistration* registration) const
+  {
+    int weights_index = node->inputs->data[kWeightsTensor];
+    if (context->tensors[weights_index].type != kTfLiteFloat32)
+    {
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                     "Does not support quantized weights in UnidirectionalSequenceRnn");
+      return false;
+    }
+    return true;
+  }
+
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override
+  {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Create UnidirectionalSequenceRnn op");
+    const auto builtin = reinterpret_cast<const TfLiteSequenceRNNParams*>(params);
+    bool time_major = builtin -> time_major;
+    tim::vx::ops::UnidirectionalSequenceRnn::ActivationType act;
+    switch (builtin -> activation)
+    {
+    case kTfLiteActRelu:
+      act = tim::vx::ops::UnidirectionalSequenceRnn::kRELU;
+      break;
+    case kTfLiteActRelu6:
+      act = tim::vx::ops::UnidirectionalSequenceRnn::kRELU6;
+      break;
+    case kTfLiteActTanh:
+      act = tim::vx::ops::UnidirectionalSequenceRnn::kTANH;
+      break;
+    case kTfLiteActSigmoid:
+      act = tim::vx::ops::UnidirectionalSequenceRnn::kSIGMOID;
+      break;
+    default:
+      printf("Not supported activition type for UnidirectionalSequenceRnn = %d", static_cast<int32_t>(builtin -> activation));
+      break;
+    }
+    auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::UnidirectionalSequenceRnn>(act, time_major);
+    auto tensor_placeholder =  delegate->GetGraph()->CreateTensorPlaceHolder();
+
+    std::vector<std::shared_ptr<tim::vx::Tensor>> input_tensors = {
+      inputs[kInputTensor],
+      inputs[kWeightsTensor],
+      inputs[kRecurrentWeightsTensor],
+      inputs[kBiasTensor],
+      tensor_placeholder,
+      inputs[kHiddenStateTensor],
+    };
+    std::vector<std::shared_ptr<tim::vx::Tensor>> output_tensor = {
+      tensor_placeholder,
+      outputs[kOutputTensor],
+    };
+    (*op).BindInputs(input_tensors);
+    (*op).BindOutputs(output_tensor);
 
     delegate->GetOps().push_back(std::move(op));
 
@@ -1975,6 +2317,263 @@ struct UnidirectionalSequenceLstm : public OpMapperBase<TfLiteUnidirectionalSequ
   }
 };
 
+struct BidirectionalSequenceLstm : public OpMapperBase<TfLiteBidirectionalSequenceLSTMParams> {
+
+  // Input Tensors
+  constexpr  static int kInputTensor = 0;
+
+  // Forward LSTM cell tensors.
+  // Input weight tensors of size: {n_cell, n_input}
+  constexpr static int kFwInputToInputWeightsTensor = 1;  // Optional
+  constexpr static int kFwInputToForgetWeightsTensor = 2;
+  constexpr static int kFwInputToCellWeightsTensor = 3;
+  constexpr static int kFwInputToOutputWeightsTensor = 4;
+
+  // Recurrent weight tensors of size {n_cell, n_output}
+  constexpr static int kFwRecurrentToInputWeightsTensor = 5;  // Optional
+  constexpr static int kFwRecurrentToForgetWeightsTensor = 6;
+  constexpr static int kFwRecurrentToCellWeightsTensor = 7;
+  constexpr static int kFwRecurrentToOutputWeightsTensor = 8;
+
+  // Peephole weights tensors of size {n_cell}, representing a diagonal matrix.
+  constexpr static int kFwCellToInputWeightsTensor = 9;    // Optional
+  constexpr static int kFwCellToForgetWeightsTensor = 10;  // Optional
+  constexpr static int kFwCellToOutputWeightsTensor = 11;  // Optional
+
+  // Gates bias tensors of size {n_cell}
+  constexpr static int kFwInputGateBiasTensor = 12;  // Optional
+  constexpr static int kFwForgetGateBiasTensor = 13;
+  constexpr static int kFwCellGateBiasTensor = 14;
+  constexpr static int kFwOutputGateBiasTensor = 15;
+
+  // Projection weight tensor of size {n_output, n_cell}
+  constexpr static int kFwProjectionWeightsTensor = 16;  // Optional
+  // Projection bias tensor of size {n_output}
+  constexpr static int kFwProjectionBiasTensor = 17;  // Optional
+
+  // Backward LSTM cell tensors.
+  // Input weight tensors of size: {n_cell, n_input}
+  constexpr static int kBwInputToInputWeightsTensor = 18;  // Optional
+  constexpr static int kBwInputToForgetWeightsTensor = 19;
+  constexpr static int kBwInputToCellWeightsTensor = 20;
+  constexpr static int kBwInputToOutputWeightsTensor = 21;
+
+  // Recurrent weight tensors of size {n_cell, n_output}
+  constexpr static int kBwRecurrentToInputWeightsTensor = 22;  // Optional
+  constexpr static int kBwRecurrentToForgetWeightsTensor = 23;
+  constexpr static int kBwRecurrentToCellWeightsTensor = 24;
+  constexpr static int kBwRecurrentToOutputWeightsTensor = 25;
+
+  // Peephole weights tensors of size {n_cell}, representing a diagonal matrix.
+  constexpr static int kBwCellToInputWeightsTensor = 26;   // Optional
+  constexpr static int kBwCellToForgetWeightsTensor = 27;  // Optional
+  constexpr static int kBwCellToOutputWeightsTensor = 28;  // Optional
+
+  // Gates bias tensors of size {n_cell}
+  constexpr static int kBwInputGateBiasTensor = 29;  // Optional
+  constexpr static int kBwForgetGateBiasTensor = 30;
+  constexpr static int kBwCellGateBiasTensor = 31;
+  constexpr static int kBwOutputGateBiasTensor = 32;
+
+  // Projection weight tensor of size {n_output, n_cell}
+  constexpr static int kBwProjectionWeightsTensor = 33;  // Optional
+  // Projection bias tensor of size {n_output}
+  constexpr static int kBwProjectionBiasTensor = 34;  // Optional
+
+  // Stateful input tensors that are variables and will be modified by the Op.
+  // Activation state tensors of size {n_batch, n_output}
+  constexpr static int kFwInputActivationStateTensor = 35;
+  // Cell state tensors of size {n_batch, n_cell}
+  constexpr static int kFwInputCellStateTensor = 36;
+  // Activation state tensors of size {n_batch, n_output}
+  constexpr static int kBwInputActivationStateTensor = 37;
+  // Cell state tensors of size {n_batch, n_cell}
+  constexpr static int kBwInputCellStateTensor = 38;
+
+  // Used as auxiliary input and weights
+  constexpr static int kAuxInputTensor = 39;  // Optional
+  // Forward weights.
+  constexpr static int kFwAuxInputToInputWeightsTensor = 40;   // Optional
+  constexpr static int kFwAuxInputToForgetWeightsTensor = 41;  // Optional
+  constexpr static int kFwAuxInputToCellWeightsTensor = 42;    // Optional
+  constexpr static int kFwAuxInputToOutputWeightsTensor = 43;  // Optional
+  // Backward weights.
+  constexpr static int kBwAuxInputToInputWeightsTensor = 44;   // Optional
+  constexpr static int kBwAuxInputToForgetWeightsTensor = 45;  // Optional
+  constexpr static int kBwAuxInputToCellWeightsTensor = 46;    // Optional
+  constexpr static int kBwAuxInputToOutputWeightsTensor = 47;  // Optional
+
+  // Output tensors.
+  constexpr static int kFwOutputTensor = 0;
+  constexpr static int kBwOutputTensor = 1;  // Ignored if merge_outputs is set.
+
+  bool IsOpSupported(TfLiteContext* context,
+                     TfLiteNode* node,
+                     const TfLiteRegistration* registration) const {
+    int i2i_index = node->inputs->data[kFwInputToInputWeightsTensor];
+    int fwprojection_weights_index = node->inputs->data[kFwProjectionWeightsTensor];
+    int fwaux_weight_index = node->inputs->data[kFwAuxInputToCellWeightsTensor];
+
+    if ( context->tensors[i2i_index].type != kTfLiteFloat32 ){
+       TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "Quantized weights are not supported");
+       return false;
+    }
+    if ( fwprojection_weights_index != -1 ){
+       TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "Projection weights are not supported");
+       return false;
+    }
+    if ( fwaux_weight_index != -1 ){
+       TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "Aux weights are not supported");
+       return false;
+    }
+
+    return true;
+  }
+
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Create BidirectionalSequenceLstm op");
+    const auto builtin = reinterpret_cast<const TfLiteBidirectionalSequenceLSTMParams*>(params);
+    float cell_clip = builtin -> cell_clip;
+    float proj_clip = builtin -> proj_clip;
+    tim::vx::ops::BidirectionalSequenceLstm::ActivationType act;
+    float forget_bias = 0;
+    bool time_major = builtin -> time_major;
+    tim::vx::ops::BidirectionalSequenceLstm::ActivationType recurrent_act_type = tim::vx::ops::BidirectionalSequenceLstm::kSIGMOID;
+    bool return_sequences = true;
+    switch (builtin -> activation)
+    {
+    case kTfLiteActRelu:
+      act = tim::vx::ops::BidirectionalSequenceLstm::kRELU;
+      break;
+    case kTfLiteActRelu6:
+      act = tim::vx::ops::BidirectionalSequenceLstm::kRELU6;
+      break;
+    case kTfLiteActTanh:
+      act = tim::vx::ops::BidirectionalSequenceLstm::kTANH;
+      break;
+    case kTfLiteActSigmoid:
+      act = tim::vx::ops::BidirectionalSequenceLstm::kSIGMOID;
+      break;
+    default:
+      printf("Not supported activition type for BidirectionalSequenceLstm = %d", static_cast<int32_t>(builtin -> activation));
+      break;
+    }
+    auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::BidirectionalSequenceLstm>(
+        cell_clip, proj_clip, act, forget_bias, time_major, recurrent_act_type, return_sequences);
+    auto tensor_placeholder = delegate->GetGraph()->CreateTensorPlaceHolder();
+
+    std::vector<std::shared_ptr<tim::vx::Tensor>> input_tensors = {
+      inputs[kInputTensor],
+
+      // Forward LSTM cell tennsors
+      // Input weight tensors
+      inputs[kFwInputToInputWeightsTensor],
+      inputs[kFwInputToForgetWeightsTensor],
+      inputs[kFwInputToCellWeightsTensor ],
+      inputs[kFwInputToOutputWeightsTensor ],
+
+      // Recurrent weight tensors
+      inputs[kFwRecurrentToInputWeightsTensor],
+      inputs[kFwRecurrentToForgetWeightsTensor ],
+      inputs[kFwRecurrentToCellWeightsTensor ],
+      inputs[kFwRecurrentToOutputWeightsTensor ],
+
+      // peephole weights : optional
+      inputs[kFwCellToInputWeightsTensor ],
+      inputs[kFwCellToForgetWeightsTensor ],
+      inputs[kFwCellToOutputWeightsTensor ],
+
+      // gate bias : optional
+      inputs[kFwInputGateBiasTensor ],
+      inputs[kFwForgetGateBiasTensor ],
+      inputs[kFwCellGateBiasTensor ],
+      inputs[kFwOutputGateBiasTensor ],
+
+      // Projection : optional
+      inputs[kFwProjectionWeightsTensor ],
+      inputs[kFwProjectionBiasTensor ],
+
+      // Backward LSTM cell tensors
+      // Input weight tensors
+      inputs[kBwInputToInputWeightsTensor],
+      inputs[kBwInputToForgetWeightsTensor],
+      inputs[kBwInputToCellWeightsTensor ],
+      inputs[kBwInputToOutputWeightsTensor ],
+
+      // Recurrent weight tensors
+      inputs[kBwRecurrentToInputWeightsTensor],
+      inputs[kBwRecurrentToForgetWeightsTensor ],
+      inputs[kBwRecurrentToCellWeightsTensor ],
+      inputs[kBwRecurrentToOutputWeightsTensor ],
+
+      // peephole weights : optional
+      inputs[kBwCellToInputWeightsTensor ],
+      inputs[kBwCellToForgetWeightsTensor ],
+      inputs[kBwCellToOutputWeightsTensor ],
+
+      // gate bias : optional
+      inputs[kBwInputGateBiasTensor ],
+      inputs[kBwForgetGateBiasTensor ],
+      inputs[kBwCellGateBiasTensor ],
+      inputs[kBwOutputGateBiasTensor ],
+
+      // Projection : optional
+      inputs[kBwProjectionWeightsTensor ],
+      inputs[kBwProjectionBiasTensor ],
+
+      // State Tensor
+      inputs[kFwInputActivationStateTensor],
+      inputs[kFwInputCellStateTensor],
+      inputs[kBwInputActivationStateTensor],
+      inputs[kBwInputCellStateTensor],
+
+      // Aux
+      inputs[kAuxInputTensor],
+      inputs[kFwAuxInputToInputWeightsTensor],
+      inputs[kFwAuxInputToForgetWeightsTensor],
+      inputs[kFwAuxInputToCellWeightsTensor],
+      inputs[kFwAuxInputToOutputWeightsTensor],
+      inputs[kBwAuxInputToInputWeightsTensor],
+      inputs[kBwAuxInputToForgetWeightsTensor],
+      inputs[kBwAuxInputToCellWeightsTensor],
+      inputs[kBwAuxInputToOutputWeightsTensor],
+
+     // LayerNorm :not used
+      tensor_placeholder,
+      tensor_placeholder,
+      tensor_placeholder,
+      tensor_placeholder,
+      tensor_placeholder,
+      tensor_placeholder,
+      tensor_placeholder,
+      tensor_placeholder,
+    };
+
+    std::vector<std::shared_ptr<tim::vx::Tensor>> output_tensors={
+      outputs[kFwOutputTensor],
+      tensor_placeholder,
+      tensor_placeholder,
+      outputs[kBwOutputTensor],
+      tensor_placeholder,
+      tensor_placeholder,
+    };
+    (*op).BindInputs(
+      input_tensors
+      );
+    (*op).BindOutputs(output_tensors);
+
+    delegate->GetOps().push_back(std::move(op));
+
+    return true;
+   } //HandleMapOp
+  };
+
 struct Batch2Space : public OpMapperBase<TfLiteBatchToSpaceNDParams> {
   virtual bool IsOpSupported(TfLiteContext* context,
                              TfLiteNode* node,
@@ -1996,16 +2595,6 @@ struct Batch2Space : public OpMapperBase<TfLiteBatchToSpaceNDParams> {
     if(context->tensors[output_index].dims->size == 0){
       TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
                       "dynamic shape in not support in batchtospace");
-      return false;
-    }
-    if ((context->tensors[input_index].type == kTfLiteInt8 ||
-         context->tensors[input_index].type == kTfLiteUInt8) &&
-        context->tensors[input_index].quantization.type ==
-            kTfLiteNoQuantization) {
-      TFLITE_LOG_PROD(
-          TFLITE_LOG_ERROR,
-          "Int8 or uint8 input without quantization is not supported in "
-          "Batch2Space");
       return false;
     }
     return true;
@@ -2108,7 +2697,7 @@ struct ReverseV2 : public OpMapperBase<TfLiteReverseSequenceParams> {
     std::vector<int> axis(axis_tensor->GetShape()[0]);
     axis_tensor->CopyDataFromTensor(axis.data());
     axis.data()[0] = vx::delegate::utils::ConvertAxis(
-        axis.data()[0], inputs[0]->GetShape().size() + 1);
+        axis.data()[0], inputs[0]->GetShape().size());
 
     auto op =
         delegate->GetGraph()->CreateOperation<tim::vx::ops::Reverse>(axis);
@@ -2164,7 +2753,7 @@ struct ReduceOpMapper : public OpMapperBase<TfLiteReducerParams> {
     auto op =
         delegate->GetGraph()->CreateOperation<T_OperationType>(axis, keep_dims);
 
-    (*op).BindInputs(inputs);
+    (*op).BindInput(inputs[0]);
     (*op).BindOutputs(outputs);
 
     delegate->GetOps().push_back(std::move(op));
@@ -2174,6 +2763,18 @@ struct ReduceOpMapper : public OpMapperBase<TfLiteReducerParams> {
 };
 
 struct ExpandDimsMapper : public OpMapperBase<EmptyStructPlaceholder> {
+  bool IsOpSupported(TfLiteContext* context,
+                     TfLiteNode* node,
+                     const TfLiteRegistration* registration) const override {
+    TfLiteTensor axis_tensor = context->tensors[node->inputs->data[1]];
+
+    if (axis_tensor.allocation_type != kTfLiteMmapRo) {
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                      "const axis_tensor is only supported in expand_dims.");
+      return false;
+    }
+    return true;
+  }
   bool HandleMapOp(vx::delegate::Delegate* delegate,
                    std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
                    std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
@@ -2409,6 +3010,55 @@ struct Select : public OpMapperBase<EmptyStructPlaceholder> {
   }
 };
 
+struct EmbeddingLookup : public OpMapperBase<EmptyStructPlaceholder> {
+  bool IsOpSupported(TfLiteContext* context,
+                     TfLiteNode* node,
+                     const TfLiteRegistration* registration) const override {
+    int weight_index = node->inputs->data[1];
+    int out_index = node->outputs->data[0];
+    if (context->tensors[weight_index].type == kTfLiteUInt8 &&
+      context->tensors[out_index].type == kTfLiteInt8){
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+           "Does not support hybrid quantization with U8 weight and I8 output");
+      return false;
+    }
+    return true;
+  }
+  bool HandleMapOp (vx::delegate::Delegate* delegate,
+                    std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                    std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                    const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Create EmbeddingLookup op");
+
+    auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::EmbeddingLookup>();
+
+    (*op).BindInputs(inputs);
+    (*op).BindOutputs(outputs);
+
+    delegate->GetOps().push_back(std::move(op));
+
+    return true;
+  }
+};
+
+struct HashtableLookup : public OpMapperBase<EmptyStructPlaceholder> {
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Create HashLookup op");
+
+    auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::HashtableLookup>();
+
+    (*op).BindInputs(inputs);
+    (*op).BindOutputs(outputs);
+
+    delegate->GetOps().push_back(std::move(op));
+
+    return true;
+  }
+};
+
 template <typename T_OperationType>
 struct LogicalOpMapper : public OpMapperBase<EmptyStructPlaceholder> {
   std::string name_;
@@ -2537,11 +3187,6 @@ struct ArgOpMapper : public OpMapperBase<EmptyStructPlaceholder> {
   bool IsOpSupported(TfLiteContext* context,
                      TfLiteNode* node,
                      const TfLiteRegistration* registration) const override {
-    if (context->tensors[node->inputs->data[0]].type == kTfLiteInt8 &&
-        context->tensors[node->outputs->data[0]].type == kTfLiteInt32) {
-      TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "I8 input/I32 output is not supported");
-      return false;
-    }
     if (0 == context->tensors[node->inputs->data[0]].dims->size ||
         0 == context->tensors[node->outputs->data[0]].dims->size) {
       TFLITE_LOG_PROD(TFLITE_LOG_WARNING, "Arg cannot support dynamic shape");
@@ -2582,12 +3227,26 @@ struct Conv3dMapper : public Conv3dKind<TfLiteConv3DParams> {
   virtual bool IsOpSupported(TfLiteContext* context,
                              TfLiteNode* node,
                              const TfLiteRegistration* registration) const {
+    const auto builtin =
+        reinterpret_cast<const TfLiteConv3DParams*>(node->builtin_data);
+    if (builtin->dilation_width_factor > 1 ||
+        builtin->dilation_height_factor > 1 ||
+        builtin->dilation_depth_factor > 1) {
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "conv3d could not support dilation > 1.");
+      return false;
+    }
     auto input_tensor = context->tensors[node->inputs->data[0]];
     auto weight_tensor = context->tensors[node->inputs->data[1]];
 
     if (input_tensor.type != weight_tensor.type) {
       TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
                       "hybrid data type is not supported in conv3d.");
+      return false;
+    }
+    if (weight_tensor.allocation_type != kTfLiteMmapRo) {
+      TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                      "weight tensor must be const in conv3d.");
       return false;
     }
     return true;
@@ -2630,6 +3289,163 @@ struct Conv3dMapper : public Conv3dKind<TfLiteConv3DParams> {
   }
 };
 
+struct ShapeMapper : public OpMapperBase<TfLiteShapeParams> {
+  bool IsOpSupported(TfLiteContext* context,
+                     TfLiteNode* node,
+                     const TfLiteRegistration* registration) const {
+    auto input_tensor = context->tensors[node->inputs->data[0]];
+    for (int i = 0; i < input_tensor.dims->size; i++) {
+      if (input_tensor.dims->data[i] <= 0) {
+        TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                        "Negative shape values are not supported.");
+        return false;
+      }
+    }
+    return true;
+  }
+  bool HandleMapOp(vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Creating Shape op");
+    std::vector<uint32_t> shape = inputs[0]->GetShape();
+    tim::vx::TensorSpec shape_spec(tim::vx::DataType::INT32,
+                                   {shape.size()},
+                                   tim::vx::TensorAttribute::CONSTANT);
+    auto shape_tensor = delegate->GetGraph()->CreateTensor(shape_spec, shape.data());
+    delegate->GetTensors()[delegate->GetOperationOutput(0)] = shape_tensor;
+    return true;
+  }
+};
+
+struct CastMapper : public OpMapperBase<EmptyStructPlaceholder> {
+  bool IsOpSupported(TfLiteContext* context,
+                     TfLiteNode* node,
+                     const TfLiteRegistration* registration) const override {
+    TfLiteTensor input_tensor = context->tensors[node->inputs->data[0]];
+    TfLiteTensor output_tensor = context->tensors[node->outputs->data[0]];
+    if (input_tensor.type == kTfLiteComplex64 || output_tensor.type == kTfLiteComplex64){
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+          "Cast could not support Complex64 input/output.");
+      return false;
+    }
+    if (input_tensor.type == kTfLiteUInt32 || output_tensor.type == kTfLiteUInt32){
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+          "Cast could not support UInt32 input/output.");
+      return false;
+    }
+    if (input_tensor.type == kTfLiteUInt16 || output_tensor.type == kTfLiteUInt16){
+      TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+          "Cast could not support UInt16 input/output.");
+      return false;
+    }
+    return true;
+  }
+
+  bool HandleMapOp (vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+  TFLITE_LOG(TFLITE_LOG_INFO, "Creating Cast op");
+  auto op = delegate->GetGraph()->CreateOperation<tim::vx::ops::Cast>();
+
+  (*op).BindInputs(inputs);
+  (*op).BindOutputs(outputs);
+
+  delegate->GetOps().push_back(std::move(op));
+
+  return true;
+  }
+};
+
+struct BroadcastToMapper : public OpMapperBase<EmptyStructPlaceholder> {
+  bool HandleMapOp (vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Create BroadcastTo op");
+
+    delegate->map_BroadcastTo [outputs[0]] = inputs[0];
+    return true;
+  }
+};
+
+struct SquareDifferenceMapper : public OpMapperBase<EmptyStructPlaceholder> {
+  bool IsOpSupported(TfLiteContext* context,
+                     TfLiteNode* node,
+                     const TfLiteRegistration* registration) const {
+    TfLiteTensor input_tensor0 = context->tensors[node->inputs->data[0]];
+    TfLiteTensor input_tensor1 = context->tensors[node->inputs->data[1]];
+    TfLiteTensor output_tensor = context->tensors[node->outputs->data[0]];
+
+    if (input_tensor0.type != input_tensor1.type) return false;
+
+    if (input_tensor0.type == kTfLiteFloat32 &&
+        output_tensor.type == kTfLiteFloat32)
+      return true;
+
+    if (((input_tensor0.type == kTfLiteInt8 &&
+          output_tensor.type == kTfLiteInt8) ||
+         (input_tensor0.type == kTfLiteUInt8 &&
+          output_tensor.type == kTfLiteUInt8)) &&
+        (reinterpret_cast<const TfLiteAffineQuantization*>(input_tensor0.quantization.params)->scale->size == 1 &&
+         reinterpret_cast<const TfLiteAffineQuantization*>(output_tensor.quantization.params)->scale->size == 1))
+      return true;
+
+    return false;
+  }
+
+  bool HandleMapOp (vx::delegate::Delegate* delegate,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& inputs,
+                   std::vector<std::shared_ptr<tim::vx::Tensor>>& outputs,
+                   const void* params) override {
+  TFLITE_LOG(TFLITE_LOG_INFO, "Creating SquareDifferenceMapper op");
+  tim::vx::DataType input_datatype = inputs[0]->GetSpec().datatype_;
+  tim::vx::TensorSpec output_spec = outputs[0]->GetSpec();
+
+  tim::vx::TensorSpec temp_tensor1_spec(tim::vx::DataType::UNKNOWN, {1},
+                                 tim::vx::TensorAttribute::CONSTANT,output_spec.quantization_);
+  std::shared_ptr<tim::vx::Tensor> temp_tensor0 = delegate->GetGraph()->CreateTensor(output_spec);
+
+  size_t temp_tensor1_size = 0;
+  std::vector<uint8_t> temp_tensor1_data(4);
+  switch (input_datatype) {
+       case tim::vx::DataType::UINT8:
+       case tim::vx::DataType::INT8: {
+        std::vector<float> temp_tensor1_scalar = {1.0};
+        std::vector<int32_t> temp_tensor1_zp = {0};
+        temp_tensor1_data[0] = 2;
+        temp_tensor1_spec.quantization_.SetScales(temp_tensor1_scalar);
+        temp_tensor1_spec.quantization_.SetZeroPoints(temp_tensor1_zp);
+        temp_tensor1_spec.datatype_ = tim::vx::DataType::UINT8;
+        break;
+       }
+       case tim::vx::DataType::FLOAT32: {
+        std::vector<float> float_data = {2.0f};
+        memcpy(temp_tensor1_data.data(), float_data.data(), sizeof(float));
+        temp_tensor1_spec.datatype_ = tim::vx::DataType::FLOAT32;
+        break;
+       }
+       default:
+        TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Unsuppoted SquareDifference type");
+        break;
+  }
+  auto temp_tensor1 = delegate->GetGraph()->CreateTensor(temp_tensor1_spec,temp_tensor1_data.data());
+
+  auto sub_op = delegate->GetGraph()->CreateOperation<tim::vx::ops::Sub>();
+  (*sub_op).BindInputs(inputs);
+  (*sub_op).BindOutput(temp_tensor0);
+  auto pow_op = delegate->GetGraph()->CreateOperation<tim::vx::ops::Pow>();
+
+  (*pow_op).BindInputs({temp_tensor0,temp_tensor1});
+  (*pow_op).BindOutputs(outputs);
+
+  delegate->GetOps().push_back(std::move(sub_op));
+  delegate->GetOps().push_back(std::move(pow_op));
+  return true;
+  }
+};
+
 using createIOpMapItemFunc = std::function<std::unique_ptr<IOpMapper>()>;
 static const std::map<int, createIOpMapItemFunc> reg = {
 #define REGISTER_OP_MAPPER(TFLITE_OP_CODE, MAPPER_TYPE, ...)                  \
@@ -2658,6 +3474,7 @@ static const std::map<int, createIOpMapItemFunc> reg = {
     REGISTER_OP_MAPPER(kTfLiteBuiltinReshape, ReshapeMapper),
     REGISTER_OP_MAPPER(kTfLiteBuiltinStridedSlice, StridedSliceMapper),
     REGISTER_OP_MAPPER(kTfLiteBuiltinPad, PadMapper),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinMirrorPad, MirrorPadMapper),
     REGISTER_OP_MAPPER(kTfLiteBuiltinExpandDims, ExpandDimsMapper),
     REGISTER_OP_MAPPER(kTfLiteBuiltinOneHot, OneHotMapper),
     REGISTER_OP_MAPPER(
@@ -2701,18 +3518,13 @@ static const std::map<int, createIOpMapItemFunc> reg = {
     REGISTER_OP_MAPPER(kTfLiteBuiltinHardSwish,
                        SimpleOpMapper<tim::vx::ops::HardSwish>,
                        "HardSwish"),
-    REGISTER_OP_MAPPER(kTfLiteBuiltinMinimum,
-                       SimpleOpMapper<tim::vx::ops::Minimum>,
-                       "Minimum"),
-    REGISTER_OP_MAPPER(kTfLiteBuiltinMaximum,
-                       SimpleOpMapper<tim::vx::ops::Maximum>,
-                       "Maximum"),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinMinimum, MinimumMapper,"Minimum"),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinMaximum, MaximumMapper,"Maximum"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinAdd, AddMapper, "Add"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinSub, SubMapper, "Sub"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinDiv, DivMapper, "Div"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinMul, MulMapper, "Multiply"),
-    REGISTER_OP_MAPPER(
-        kTfLiteBuiltinPow, PowMapper<tim::vx::ops::Pow>, "Pow"),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinPow, PowMapper<tim::vx::ops::Pow>, "Pow"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinResizeNearestNeighbor,
                        ResizeMapper<tim::vx::ResizeType::NEAREST_NEIGHBOR>),
     REGISTER_OP_MAPPER(kTfLiteBuiltinResizeBilinear,
@@ -2737,13 +3549,19 @@ static const std::map<int, createIOpMapItemFunc> reg = {
     REGISTER_OP_MAPPER(kTfLiteBuiltinTranspose, Transpose),
     REGISTER_OP_MAPPER(kTfLiteBuiltinBatchMatmul, BatchMatmul),
     REGISTER_OP_MAPPER(kTfLiteBuiltinRnn, Rnn),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinUnidirectionalSequenceRnn, UnidirectionalSequenceRnn),
+    REGISTER_OP_MAPPER(
+        kTfLiteBuiltinBidirectionalSequenceRnn, BidirectionalSequenceRnn),
     REGISTER_OP_MAPPER(
         kTfLiteBuiltinNeg, SimpleOpMapper<tim::vx::ops::Neg>, "Neg"),
     REGISTER_OP_MAPPER(
         kTfLiteBuiltinTanh, SimpleOpMapper<tim::vx::ops::Tanh>, "tanh"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinGather, Gather),
     REGISTER_OP_MAPPER(kTfLiteBuiltinGatherNd, GatherNd),
-    REGISTER_OP_MAPPER(kTfLiteBuiltinUnidirectionalSequenceLstm, UnidirectionalSequenceLstm),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinUnidirectionalSequenceLstm,
+                       UnidirectionalSequenceLstm),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinBidirectionalSequenceLstm,
+                       BidirectionalSequenceLstm),
     REGISTER_OP_MAPPER(kTfLiteBuiltinBatchToSpaceNd, Batch2Space),
     REGISTER_OP_MAPPER(kTfLiteBuiltinSpaceToBatchNd, Space2Batch),
     REGISTER_OP_MAPPER(kTfLiteBuiltinReverseV2, ReverseV2),
@@ -2782,6 +3600,12 @@ static const std::map<int, createIOpMapItemFunc> reg = {
     REGISTER_OP_MAPPER(
         kTfLiteBuiltinArgMax, ArgOpMapper<tim::vx::ops::ArgMax>, "Max"),
     REGISTER_OP_MAPPER(kTfLiteBuiltinConv3d, Conv3dMapper),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinShape, ShapeMapper),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinEmbeddingLookup, EmbeddingLookup),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinHashtableLookup, HashtableLookup),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinCast, CastMapper),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinBroadcastTo, BroadcastToMapper),
+    REGISTER_OP_MAPPER(kTfLiteBuiltinSquaredDifference, SquareDifferenceMapper),
 
 #undef REGISTER_OP_MAPPER
 };

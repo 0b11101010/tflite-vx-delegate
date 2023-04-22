@@ -32,7 +32,9 @@ project(tflite_vx_delegate)
 
 OPTION(ENABLE_NBG_SUPPORT "enable customized nbg op in tflite" ON)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 if(ANDROID_TOOLCHAIN)
 # bypass warning as error since tensorflow lite can not pass with android ndk r22b
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error -Wno-c++11-narrowing")
@@ -53,6 +55,10 @@ list(APPEND VX_DELEGATES_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_adaptor.cc
 )
 
+if(TFLITE_ENABLE_MULTI_DEVICE)
+  ADD_DEFINITIONS(-DMULTI_DEVICE_FEATURE_MODE)
+endif()
+
 add_library(vx_delegate SHARED ${VX_DELEGATES_SRCS})
 
 list(APPEND VX_CUSTOM_OP_SRCS
@@ -63,6 +69,9 @@ if(ANDROID_TOOLCHAIN)
 endif()
 
 target_link_libraries(vx_delegate ${VX_DELEGATE_DEPENDENCIES})
+if((NOT DEFINED TIM_VX_INSTALL))
+target_link_libraries(vx_delegate -Wl,--whole-archive tim-vx)
+endif()
 add_library(vx_custom_op STATIC ${VX_CUSTOM_OP_SRCS})
 target_include_directories(vx_custom_op PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(vx_custom_op TensorFlow::tensorflow-lite)
