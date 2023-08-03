@@ -1,7 +1,6 @@
 import pytest
 import tensorflow as tf
-from tensorflow.python import keras
-import numpy as np
+from tensorflow import keras
 import utils
 import tempfile
 import os
@@ -41,7 +40,7 @@ def test_attention(delegate_lib, save_model, num_of_seq, seq_len, in_num_heads, 
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.representative_dataset = rand_dataset
         converter.inference_input_type = tf.int8
-        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
 
     tflite_model = converter.convert()
 
@@ -61,6 +60,5 @@ def test_attention(delegate_lib, save_model, num_of_seq, seq_len, in_num_heads, 
     cpu_ = utils.cpu()
     (gold_in, gold_out)= cpu_.run_with_rand_data(model_path)
     npu_out = npu_.run(model_path, gold_in)
-    for (g, n) in zip(gold_out, npu_out):
-        assert g == pytest.approx(n[1])
+    pytest.approx(gold_out,npu_out)
     temp_model.close()

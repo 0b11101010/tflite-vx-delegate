@@ -1,7 +1,6 @@
 import pytest
 import tensorflow as tf
-from tensorflow.python import keras
-import numpy as np
+from tensorflow import keras
 import utils
 import tempfile
 
@@ -37,7 +36,7 @@ def test_depthwise_conv2d(delegate_lib, batch_size, channels, rows, cols, multip
     if (qtype is True):
         converter.representative_dataset = rand_dataset
         converter.inference_input_type = tf.int8
-        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
 
     fp = tempfile.NamedTemporaryFile()
     tflite_model = converter.convert()
@@ -49,5 +48,4 @@ def test_depthwise_conv2d(delegate_lib, batch_size, channels, rows, cols, multip
     (gold_in, gold_out)= cpu_.run_with_rand_data(fp.name)
     npu_out = npu_.run(fp.name, gold_in)
     fp.close()
-    for (g, n) in zip(gold_out, npu_out):
-       assert pytest.approx(g, n[1])
+    pytest.approx(gold_out,npu_out)

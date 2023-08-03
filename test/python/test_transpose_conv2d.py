@@ -1,7 +1,6 @@
 import pytest
 import tensorflow as tf
-from tensorflow.python import keras
-import numpy as np
+from tensorflow import keras
 import utils
 import tempfile
 
@@ -38,7 +37,7 @@ def test_transpose_conv2d(delegate_lib, batch_size, channels, filters, rows, col
     if (qtype is True):
         converter.representative_dataset = rand_dataset
         converter.inference_input_type = tf.int8
-        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
     tflite_model = converter.convert()
 
     npu_ = utils.npu(delegate_lib)
@@ -55,6 +54,4 @@ def test_transpose_conv2d(delegate_lib, batch_size, channels, filters, rows, col
     # open(model_path, "wb").write(tflite_model)
     # (gold_in, gold_out)= cpu_.run_with_rand_data(model_path)
     # npu_out = npu_.run(model_path, gold_in)
-
-    for (g, n) in zip(gold_out, npu_out):
-       assert pytest.approx(g, n[1])
+    pytest.approx(gold_out,npu_out)
